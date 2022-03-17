@@ -29,14 +29,15 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include "list.h"
-#include "util.h"
-#include "usb.h"
-#include "ipc.h"
-#include "dispatch.h"
-#include "net.h"
-#include "log.h"
-#include "frame.h"
+#include "../lib/list.h"
+#include "../lib/util.h"
+#include "../lib/usb.h"
+#include "../lib/ipc.h"
+#include "../lib/dispatch.h"
+#include "../lib/net.h"
+#include "../lib/log.h"
+#include "../lib/frame.h"
+#include "../lib/rpidali.h"
 
 // Network protocol:
 // struct BusMessage {
@@ -97,8 +98,8 @@ static IpcPtr killsocket;
 static int running;
 
 static void signal_handler(int sig);
-static void dali_outband_handler(UsbDaliError err, DaliFramePtr frame, unsigned int status, void *arg);
-static void dali_inband_handler(UsbDaliError err, DaliFramePtr frame, unsigned int response, unsigned int status, void *arg);
+static void dali_outband_handler(RpiDaliError err, DaliFramePtr frame, unsigned int status, void *arg);
+static void dali_inband_handler(RpiDaliError err, DaliFramePtr frame, unsigned int response, unsigned int status, void *arg);
 static void net_frame_handler(void *arg, const char *buffer, size_t bufsize, ConnectionPtr conn);
 static void net_dequeue_connection(void *arg, ConnectionPtr conn);
 static Options *parse_opt(int argc, char *const argv[]);
@@ -143,26 +144,32 @@ int main(int argc, char *const argv[]) {
 		//dispatch_set_timeout(dispatch, 100);
 
 		UsbDaliPtr usb = NULL;
+		RpiDaliPtr rpi = NULL;
+
 		if (!opts->dryrun) {
-			log_debug("Initializing USB connection");
-			usb = usbdali_open(NULL, dispatch, opts->usbbus, opts->usbdev);
-			if (!usb) {
+			log_debug("Initializing connection to RPI");
+			//usb = usbdali_open(NULL, dispatch, opts->usbbus, opts->usbdev);
+			rpi = rpidali_open(dispatch);
+			// if (!usb) {
+			// 	error = -1;
+			// }
+			if (!rpi) {
 				error = -1;
 			}
 		}
 
-		if (opts->dryrun || usb) {
+		if (opts->dryrun || rpi) {
 			log_debug("Initializing server");
-			ServerPtr server = server_open(dispatch, opts->address, opts->port, DEFAULT_NET_FRAMESIZE, net_frame_handler, usb);
+			ServerPtr server = server_open(dispatch, opts->address, opts->port, DEFAULT_NET_FRAMESIZE, net_frame_handler, rpi);
 
 			if (!server) {
 				error = -1;
 			} else {
-				server_set_connection_destroy_callback(server, net_dequeue_connection, usb);
+				server_set_connection_destroy_callback(server, net_dequeue_connection, rpi);
 				
-				if (usb) {
-					usbdali_set_outband_callback(usb, dali_outband_handler, server);
-					usbdali_set_inband_callback(usb, dali_inband_handler);
+				if (rpi) {
+					rpidali_set_outband_callback(rpi, dali_outband_handler, server);
+					rpidali_set_inband_callback(rpi, dali_inband_handler);
 				}
 
 				log_debug("Creating shutdown notifier");
@@ -177,7 +184,7 @@ int main(int argc, char *const argv[]) {
 					running = 1;
 					signal(SIGTERM, signal_handler);
 					signal(SIGINT, signal_handler);
-					while (running && dispatch_run(dispatch, usbdali_get_timeout(usb)));
+					while (running && dispatch_run(dispatch, -1));  //rpidali_get_timeout(rpi)));
 
 					log_info("Shutting daliserver down");
 					ipc_free(killsocket);
@@ -186,8 +193,8 @@ int main(int argc, char *const argv[]) {
 				server_close(server);
 			}
 			
-			if (usb) {
-				usbdali_close(usb);
+			if (rpi) {
+				rpidali_close(rpi);
 			}
 		}
 
@@ -212,9 +219,9 @@ static void signal_handler(int sig) {
 	}
 }
 
-static void dali_outband_handler(UsbDaliError err, DaliFramePtr frame, unsigned int status, void *arg) {
+static void dali_outband_handler(RpiDaliError err, DaliFramePtr frame, unsigned int status, void *arg) {
 	log_debug("Outband message received");
-	if (err == USBDALI_SUCCESS) {
+	if (err == RPIDALI_SUCCESS) {
 		log_info("Broadcast (0x%02x 0x%02x) [0x%04x]", frame->address, frame->command, status);
 		ServerPtr server = (ServerPtr) arg;
 		if (server) {
@@ -228,15 +235,16 @@ static void dali_outband_handler(UsbDaliError err, DaliFramePtr frame, unsigned 
 	}
 }
 
-static void dali_inband_handler(UsbDaliError err, DaliFramePtr frame, unsigned int response, unsigned int status, void *arg) {
+static void dali_inband_handler(RpiDaliError err, DaliFramePtr frame, unsigned int response, unsigned int status, void *arg) {
 	log_debug("Inband message received");
-	if (err == USBDALI_SUCCESS || err == USBDALI_RESPONSE) {
+	if (err == RPIDALI_SUCCESS || err == RPIDALI_RESPONSE) {
 		log_info("Response to (0x%02x 0x%02x): 0x%02x [0x%04x]", frame->address, frame->command, response, status);
 		ConnectionPtr conn = (ConnectionPtr) arg;
 		if (conn) {
-			char rbuffer[DEFAULT_NET_FRAMESIZE];
+			char rbuffer[4];
 			rbuffer[0] = DEFAULT_NET_PROTOCOL;
-			if (err == USBDALI_RESPONSE) {
+
+			if (err == RPIDALI_RESPONSE) {
 				rbuffer[1] = NET_STATUS_RESPONSE;
 				rbuffer[2] = (uint8_t) response;
 			} else {
@@ -265,10 +273,10 @@ static void net_frame_handler(void *arg, const char *buffer, size_t bufsize, Con
 		log_info("Got frame: 0x%02x 0x%02x 0x%02x 0x%02x", (uint8_t) buffer[0], (uint8_t) buffer[1], (uint8_t) buffer[2], (uint8_t) buffer[3]);
 		if ((uint8_t) buffer[0] == DEFAULT_NET_PROTOCOL) {
 			if ((uint8_t) buffer[1] == NET_TYPE_SEND) {
-				UsbDaliPtr dali = (UsbDaliPtr) arg;
+				RpiDaliPtr dali = (RpiDaliPtr) arg;
 				if (dali) {
 					DaliFramePtr frame = daliframe_new((uint8_t) buffer[2], (uint8_t) buffer[3]);
-					usbdali_queue(dali, frame, conn);
+					rpidali_queue(dali, frame, conn);
 				} else {
 					uint8_t response = 0;
 					log_info("Faking response: 0x%02x", response);
